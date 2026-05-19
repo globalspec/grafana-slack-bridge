@@ -1,0 +1,87 @@
+# Grafana provisioning example for grafana-slack-bridge.
+#
+# Drop this (or merge with your existing alerting provisioning config) into
+# Grafana's provisioning/alerting/ directory. With Helm, this typically lives
+# in a ConfigMap labeled `grafana_alert: "1"` so the sidecar picks it up.
+#
+# Multi-channel pattern: each Slack channel gets its own contactPoint with a
+# different ?channel= on the bridge URL. Routing happens via the notification
+# policy tree (next section).
+
+apiVersion: 1
+contactPoints:
+  # Infra alerts → #alerts-grafana
+  - orgId: 1
+    name: "Slack (infra)"
+    receivers:
+      - uid: slack-infra
+        type: webhook
+        disableResolveMessage: false
+        settings:
+          # Replace the host with your Service / DNS name and the channel ID
+          # with the destination channel (right-click in Slack → Channel ID).
+          url: http://grafana-slack-bridge.grafana.svc/webhook?channel=C012345ABCD
+          httpMethod: POST
+
+  # Dev alerts → #alerts-devs
+  - orgId: 1
+    name: "Slack (devs)"
+    receivers:
+      - uid: slack-devs
+        type: webhook
+        disableResolveMessage: false
+        settings:
+          url: http://grafana-slack-bridge.grafana.svc/webhook?channel=C098765WXYZ
+          httpMethod: POST
+
+---
+# Notification policy tree. Route by label, not by channel name.
+#
+# Rules carry labels like `team=infra` or `team=devs`. The policy tree maps
+# each label set to a contactPoint, which carries the channel via its URL.
+# Rules don't need to know which channel they go to.
+
+apiVersion: 1
+policies:
+  - orgId: 1
+    # Root receiver — provisioning forces a single root policy per org.
+    # Pick something safe that pages a human if nothing matches sub-routes.
+    receiver: "Email"
+    group_by: [alertname]
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 4h
+    routes:
+      # Server-monitoring / infra alerts
+      - receiver: "Slack (infra)"
+        matchers:
+          - slack = "true"
+          - team = "infra"
+        group_by: [alertname, host, severity]
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 4h
+        routes:
+          # Critical infra alerts: faster group_wait, shorter repeat
+          - receiver: "Slack (infra)"
+            matchers:
+              - severity = "critical"
+            group_wait: 10s
+            repeat_interval: 1h
+
+      # Dev alerts
+      - receiver: "Slack (devs)"
+        matchers:
+          - slack = "true"
+          - team = "devs"
+        group_by: [alertname, service, severity]
+        group_wait: 30s
+        group_interval: 5m
+        repeat_interval: 4h
+
+---
+# Message templates the bridge can pull from. The bridge has its own message
+# formatter (see src/bridge.py format_title / format_alert_section), so these
+# templates only matter if you set the webhook contact point to use a custom
+# body template. For most setups, the bridge's defaults are fine — leave
+# these out.

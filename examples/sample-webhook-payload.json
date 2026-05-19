@@ -1,0 +1,38 @@
+{
+  "receiver": "Slack (infra)",
+  "status": "firing",
+  "groupKey": "{}/{slack=\"true\",team=\"infra\"}:{alertname=\"HighCpu\", host=\"web-01\"}",
+  "commonLabels": {
+    "alertname": "HighCpu",
+    "host": "web-01",
+    "severity": "warning",
+    "slack": "true",
+    "team": "infra"
+  },
+  "commonAnnotations": {
+    "summary": "Sustained CPU > 90% on web-01",
+    "description": "CPU has been above 90% for 5 minutes."
+  },
+  "title": "[FIRING:1] HighCpu",
+  "alerts": [
+    {
+      "status": "firing",
+      "labels": {
+        "alertname": "HighCpu",
+        "host": "web-01",
+        "severity": "warning",
+        "scope": "host"
+      },
+      "annotations": {
+        "summary": "Sustained CPU > 90% on web-01",
+        "description": "CPU has been above 90% for 5 minutes. Check top processes.",
+        "dashboard_url": "https://grafana.example.com/d/example-dashboard?viewPanel=5&var-host=web-01",
+        "runbook_url": "https://runbooks.example.com/high-cpu"
+      },
+      "startsAt": "2026-05-19T12:34:56Z",
+      "endsAt": "0001-01-01T00:00:00Z",
+      "generatorURL": "https://grafana.example.com/alerting/grafana/abc123/view",
+      "silenceURL": "https://grafana.example.com/alerting/silence/new?alertmanager=grafana&matcher=alertname%3DHighCpu"
+    }
+  ]
+}

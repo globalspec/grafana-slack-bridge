@@ -1,0 +1,60 @@
+# grafana-slack-bridge — docker-compose example
+#
+# Usage:
+#   1. Copy examples/config.env → ./grafana-slack-bridge.env and fill in SLACK_BOT_TOKEN
+#   2. chmod 0600 ./grafana-slack-bridge.env
+#   3. docker compose up -d
+#
+# Configuration reference: ../docs/configuration.md
+# Hardening notes:        ../docs/installation-docker.md#hardening
+
+services:
+  grafana-slack-bridge:
+    image: ghcr.io/your-org/grafana-slack-bridge:v0.3.0
+    container_name: grafana-slack-bridge
+    restart: unless-stopped
+
+    # Bind to 127.0.0.1 only — Grafana should reach the bridge via reverse
+    # proxy, SSH tunnel, or be on the same host. Remove the 127.0.0.1: prefix
+    # ONLY if you trust everyone with network access to this port (a malicious
+    # actor on that network can post fake alerts to Slack).
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    env_file:
+      - ./grafana-slack-bridge.env
+
+    environment:
+      # These can also live in the env file — kept here so they're visible
+      # in `docker compose config` output without leaking the bot token.
+      SLACK_CHANNEL: alerts-grafana
+      STATE_TTL_HOURS: "24"
+      # Uncomment to enable in-bridge image rendering:
+      #GRAFANA_URL: http://grafana:3000
+
+    # Hardening
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+    user: "1000:1000"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8080/healthz', timeout=2)"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

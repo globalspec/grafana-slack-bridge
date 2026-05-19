@@ -1,0 +1,56 @@
+[Unit]
+Description=grafana-slack-bridge — Grafana → Slack webhook receiver
+Documentation=https://github.com/your-org/grafana-slack-bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=grafana-slack-bridge
+Group=grafana-slack-bridge
+WorkingDirectory=/opt/grafana-slack-bridge
+
+# All sensitive config lives here. chmod 0600, owned by grafana-slack-bridge.
+EnvironmentFile=/etc/grafana-slack-bridge.env
+
+# Single worker — in-memory state would race if multiplexed. Threads (not
+# processes) share state, so --threads is safe and useful.
+ExecStart=/opt/grafana-slack-bridge/.venv/bin/gunicorn \
+    --bind 0.0.0.0:8080 \
+    --workers 1 \
+    --threads 8 \
+    --access-logfile - \
+    src.bridge:app
+
+Restart=on-failure
+RestartSec=5
+
+# ─── Hardening ─────────────────────────────────────────────────────────
+# These defaults are appropriate for a small Python HTTP service that
+# doesn't need any privileged access. Don't relax without a reason.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+RestrictAddressFamilies=AF_INET AF_INET6
+
+# The venv and source are read-only via ProtectSystem=strict. The bridge
+# doesn't write to disk; nothing under /opt/grafana-slack-bridge needs to be
+# writable at runtime. Add a ReadWritePaths= entry here if you ever need one.
+
+[Install]
+WantedBy=multi-user.target

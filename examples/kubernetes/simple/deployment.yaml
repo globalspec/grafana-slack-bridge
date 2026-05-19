@@ -1,0 +1,97 @@
+---
+# grafana-slack-bridge — minimal Kubernetes deployment.
+#
+# This example uses a regular k8s Secret for the Slack bot token. Create it
+# before applying:
+#
+#   kubectl -n grafana create secret generic grafana-slack-bot-token \
+#     --from-literal=SLACK_BOT_TOKEN=xoxb-...
+#
+# If you also want bridge-rendered images, create a second Secret with the
+# Grafana service-account token (the deployment references it as optional):
+#
+#   kubectl -n grafana create secret generic grafana-bridge-render-token \
+#     --from-literal=GRAFANA_TOKEN=glsa_...
+#
+# See examples/kubernetes/vault-csi/ for the equivalent setup with HashiCorp
+# Vault + the Secrets Store CSI driver if you don't want secrets in k8s
+# directly.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana-slack-bridge
+  namespace: grafana
+  labels:
+    app.kubernetes.io/name: grafana-slack-bridge
+    app.kubernetes.io/version: v0.3.0
+spec:
+  replicas: 1                          # in-memory state — do not scale horizontally
+  strategy:
+    type: Recreate                     # avoid losing state during rolling updates
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: grafana-slack-bridge
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: grafana-slack-bridge
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: bridge
+          image: ghcr.io/your-org/grafana-slack-bridge:v0.3.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: SLACK_CHANNEL
+              value: "alerts-grafana"
+            - name: SLACK_CHANNEL_ID
+              value: "C012345ABCD"     # default channel ID; per-contactpoint ?channel= overrides
+            - name: STATE_TTL_HOURS
+              value: "24"
+            # Uncomment to enable bridge-side panel rendering. Requires the
+            # grafana-bridge-render-token Secret below.
+            #- name: GRAFANA_URL
+            #  value: "http://grafana:3000"
+          envFrom:
+            - secretRef:
+                name: grafana-slack-bot-token       # provides SLACK_BOT_TOKEN
+                optional: false
+            - secretRef:
+                name: grafana-bridge-render-token   # provides GRAFANA_TOKEN (optional)
+                optional: true
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 30
+            timeoutSeconds: 3
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+            timeoutSeconds: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            # Python + gunicorn need a writable /tmp. readOnlyRootFilesystem
+            # blocks the default mount, so we provide an emptyDir overlay.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
