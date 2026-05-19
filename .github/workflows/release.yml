@@ -52,10 +52,14 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Preserve the `v` prefix to match how git tags are named
+          # (`v0.3.2`, not `0.3.2`). Without `v{{version}}` the action
+          # strips it — leaving manifests that reference `:v0.3.2` unable
+          # to pull. Each pattern is a separate tag the image gets.
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern=v{{version}}
+            type=semver,pattern=v{{major}}.{{minor}}
+            type=semver,pattern=v{{major}}
             type=raw,value=latest,enable={{is_default_branch}}
           # Annotations land on the OCI manifest index for multi-arch builds.
           annotations: |
