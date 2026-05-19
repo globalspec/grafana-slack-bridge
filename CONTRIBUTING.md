@@ -82,14 +82,20 @@ When making changes that affect message formatting or webhook handling:
 
 (maintainers only)
 
+The `.github/workflows/release.yml` workflow automates steps 4 below — pushing a tag triggers the multi-arch build and image publish to GHCR. The steps below describe the manual process for the rare case where you need to publish from a workstation.
+
 1. Bump version in `CHANGELOG.md` (move "Unreleased" entries under the new version with date)
 2. Tag: `git tag -s v0.X.Y -m "v0.X.Y"`
-3. Push: `git push origin main --tags`
-4. Build and push the multi-arch image:
+3. Push: `git push origin main --tags`  — this fires the release workflow
+4. **(Manual fallback only — the workflow does this automatically.)** Build and push the multi-arch image:
    ```bash
    docker buildx build --platform linux/amd64,linux/arm64 \
+     --annotation "index:org.opencontainers.image.source=https://github.com/your-org/grafana-slack-bridge" \
+     --annotation "index:org.opencontainers.image.description=Grafana → Slack webhook receiver that does chat.update for in-place alert updates" \
+     --annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
      -t ghcr.io/your-org/grafana-slack-bridge:v0.X.Y \
      -t ghcr.io/your-org/grafana-slack-bridge:latest \
      --push .
    ```
+   The `--annotation "index:…"` flags are essential for multi-arch images. Plain `LABEL` instructions in the Dockerfile only land in per-platform image configs — GHCR's UI reads `org.opencontainers.image.{source,description,licenses}` from the **manifest index** annotations to link the package back to its source repo, render a description, and display the license. Skip the `--annotation` flags and you get a package with no description and no repo link, even though `LABEL` entries exist in the Dockerfile.
 5. Create a GitHub release with the changelog entry as the body
