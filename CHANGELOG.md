@@ -6,6 +6,23 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-05-19
+
+### Fixed
+- **State cleanup thread never started under gunicorn.** The thread that
+  ages out tracked `(groupKey → ts)` mappings was started inside
+  `if __name__ == "__main__":`, which gunicorn doesn't execute. State
+  entries therefore lived forever. Cleanup thread now starts at module
+  import time with a one-shot guard.
+- **Re-fires after resolve were silent.** On resolve the bridge used to
+  keep the state entry around for 30 minutes so flap re-fires would
+  `chat.update` the same message. Slack doesn't push notifications on
+  edits, so the re-fire appeared on-screen but the operator got no
+  ping. The bridge now evicts state immediately on resolve — the next
+  firing for the same groupKey takes the new-post path and produces a
+  real notification. Grafana's `for:` clauses + group_interval already
+  prevent sub-second flap-spam, so eviction-on-resolve is safe.
+
 ## [0.3.1] — 2026-05-19
 
 ### Security
@@ -74,7 +91,8 @@ All notable changes to this project are documented here. Format follows
 - Initial release. Bridges Grafana webhook contact points to Slack with
   `chat.update` for in-place message updates per alert group.
 
-[Unreleased]: https://github.com/your-org/grafana-slack-bridge/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/your-org/grafana-slack-bridge/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/your-org/grafana-slack-bridge/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/your-org/grafana-slack-bridge/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/your-org/grafana-slack-bridge/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/your-org/grafana-slack-bridge/compare/v0.2.1...v0.2.2

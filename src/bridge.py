@@ -536,12 +536,16 @@ def _handle_webhook(payload: Dict, group_key: str, channel_override: str = "") -
         })
         if update.get("ok"):
             with state_lock:
-                state[group_key]["last_update"] = time.time()
-            # When resolved, schedule eviction sooner so a re-fire posts new
-            if status == "resolved":
-                with state_lock:
-                    # 30-minute lingering window; after that, re-fire is a new message
-                    state[group_key]["last_update"] = time.time() - STATE_TTL_SEC + 1800
+                if status == "resolved":
+                    # Evict immediately on resolve. A subsequent firing for the
+                    # same groupKey then takes the new-post path → fresh Slack
+                    # message → mobile/desktop notification. Without eviction,
+                    # the next firing would chat.update the now-resolved-styled
+                    # message in place, which Slack does NOT push a notification
+                    # for — the operator would miss the re-fire entirely.
+                    state.pop(group_key, None)
+                else:
+                    state[group_key]["last_update"] = time.time()
             app.logger.info(
                 "update ok status=%s group_key=%s ts=%s image=%s",
                 status, group_key, entry["ts"], has_image,
@@ -628,6 +632,30 @@ def _handle_webhook(payload: Dict, group_key: str, channel_override: str = "") -
     return {"action": "failed", "error": post.get("error")}, 502
 
 
+# Start the cleanup thread at module import time so it runs under both
+# `python3 src/bridge.py` (dev) AND `gunicorn src.bridge:app` (prod).
+# Previously this lived inside the `if __name__ == "__main__":` block
+# below, which gunicorn never executes — the thread silently never
+# started, state entries never aged out, and chat.update kept editing
+# already-resolved messages forever instead of posting fresh ones.
+#
+# Guarded against double-start: gunicorn with --workers > 1 would import
+# the module per worker; we only run --workers 1 today but the guard is
+# cheap insurance for anyone who scales up after swapping the in-memory
+# state dict for Redis.
+_cleanup_started = False
+_cleanup_lock = threading.Lock()
+
+def _start_cleanup_once():
+    global _cleanup_started
+    with _cleanup_lock:
+        if _cleanup_started:
+            return
+        _cleanup_started = True
+        threading.Thread(target=cleanup_loop, daemon=True).start()
+
+_start_cleanup_once()
+
+
 if __name__ == "__main__":
-    threading.Thread(target=cleanup_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=PORT)
