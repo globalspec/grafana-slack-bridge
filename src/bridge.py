@@ -28,6 +28,14 @@ Configuration via env:
   PORT                — listen port (default 8080)
   STATE_TTL_HOURS     — drop tracked groups idle longer than this (default 24)
 
+Escalation (re-surface long-unresolved alerts) — OFF unless configured:
+  ESCALATION_CHANNEL_ID — Slack channel ID (Cxxxx) for escalations. Unset ⇒
+                        escalation disabled entirely (default behaviour).
+  ESCALATE_AFTER_HOURS  — a firing alert unresolved this long escalates (default 4)
+  ESCALATE_SEVERITIES   — comma list of severities that can escalate (default "critical")
+  ESCALATE_MENTION      — Slack mention prepended to escalations so they actually
+                        push a notification (default "<!here>"; "" disables the ping)
+
 Per-contact-point channel routing:
   Add ?channel=Cxxxxxx (channel ID) or ?channel=name to the webhook URL on
   each Grafana contact point. This wins over SLACK_CHANNEL/SLACK_CHANNEL_ID,
@@ -69,6 +77,23 @@ SLACK_CHANNEL = _env("SLACK_CHANNEL", "alerts-grafana")
 SLACK_CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
 PORT = int(_env("PORT", "8080"))
 STATE_TTL_SEC = int(_env("STATE_TTL_HOURS", "24")) * 3600
+
+# ── Escalation config ──────────────────────────────────────────────────────
+# When an alert of an escalated severity has been FIRING continuously for
+# ESCALATE_AFTER_SEC without resolving, post a single fresh, mention-tagged
+# message to ESCALATION_CHANNEL_ID. The primary path does chat.update in place,
+# which Slack never re-notifies for — so a critical that has been quietly
+# edited for hours otherwise sinks unnoticed. This re-surfaces it, once, in a
+# dedicated channel. Feature is OFF unless ESCALATION_CHANNEL_ID is set, so the
+# default deployment is byte-for-byte unchanged.
+ESCALATION_CHANNEL_ID = os.environ.get("ESCALATION_CHANNEL_ID", "").strip()
+ESCALATE_AFTER_SEC = int(os.environ.get("ESCALATE_AFTER_HOURS", "4")) * 3600
+ESCALATE_SEVERITIES = {
+    s.strip() for s in os.environ.get("ESCALATE_SEVERITIES", "critical").split(",") if s.strip()
+}
+# Prepended to escalation messages so Slack actually pushes a notification.
+# "<!here>" pings active members; "<!channel>" everyone; "" = no ping.
+ESCALATE_MENTION = os.environ.get("ESCALATE_MENTION", "<!here>").strip()
 
 # Grafana render endpoint — used to fetch host-specific panel images for the
 # firing alert. Grafana's built-in screenshot pipeline doesn't reliably attach
@@ -460,6 +485,106 @@ def build_message(payload: Dict) -> Dict[str, Any]:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# Escalation
+# ──────────────────────────────────────────────────────────────────────────
+
+def _parse_rfc3339(ts: str) -> Optional[float]:
+    """Parse Grafana's RFC3339 startsAt to an epoch float. None on failure or on
+    the zero-time sentinel Grafana emits for an unset time (0001-01-01...)."""
+    if not ts or ts.startswith("0001-01-01"):
+        return None
+    from datetime import datetime
+    s = ts.strip().replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        # Belt-and-braces for odd fractional-second precision on older runtimes.
+        import re as _re
+        m = _re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(\.\d+)?([+-]\d{2}:\d{2})?$", s)
+        if not m:
+            return None
+        base, frac, off = m.group(1), (m.group(2) or "")[:7], (m.group(3) or "+00:00")
+        try:
+            return datetime.fromisoformat(base + frac + off).timestamp()
+        except ValueError:
+            return None
+
+
+def firing_age_sec(payload: Dict) -> Optional[float]:
+    """Longest continuous firing age (sec) in the group = now − earliest startsAt
+    among currently-firing alerts. None if no firing alert carries a usable time."""
+    now = time.time()
+    ages = [now - t for a in (payload.get("alerts") or [])
+            if a.get("status") == "firing"
+            for t in [_parse_rfc3339(a.get("startsAt", ""))] if t is not None]
+    return max(ages) if ages else None
+
+
+def build_escalation_message(payload: Dict, age_sec: float) -> Dict[str, Any]:
+    """Escalation variant of the normal message: a mention + 'unresolved Nh'
+    banner prepended, forced critical colour. Mention goes in top-level `text`
+    too so Slack actually pushes the notification."""
+    base = build_message(payload)
+    hours = age_sec / 3600.0
+    banner = (ESCALATE_MENTION + " " if ESCALATE_MENTION else "") + \
+        f":bangbang: *ESCALATED — unresolved for {hours:.1f}h*"
+    att = dict(base["attachments"][0])
+    att["color"] = SEVERITY_COLOR["critical"]
+    att["blocks"] = [{"type": "section", "text": {"type": "mrkdwn", "text": banner}}] + \
+        list(att.get("blocks", []))
+    text = (ESCALATE_MENTION + " " if ESCALATE_MENTION else "") + base.get("text", "")
+    return {"text": text, "attachments": [att]}
+
+
+def maybe_escalate(payload: Dict, group_key: str) -> None:
+    """Post a one-time escalation for a long-unresolved firing alert. No-op unless
+    the feature is configured. Call AFTER the primary send, with state unlocked."""
+    if not ESCALATION_CHANNEL_ID:
+        return
+    severity = (payload.get("commonLabels") or {}).get("severity", "")
+    if severity not in ESCALATE_SEVERITIES:
+        return
+    age = firing_age_sec(payload)
+    if age is None or age < ESCALATE_AFTER_SEC:
+        return
+    # Claim the escalation under lock so concurrent webhooks escalate once.
+    with state_lock:
+        entry = state.get(group_key)
+        if entry is None or entry.get("escalated"):
+            return
+        entry["escalated"] = True
+    post = slack_call("chat.postMessage",
+                      {"channel": ESCALATION_CHANNEL_ID, **build_escalation_message(payload, age)})
+    with state_lock:
+        entry = state.get(group_key)
+        if post.get("ok"):
+            if entry is not None:
+                entry["escalation_ts"] = post["ts"]
+                entry["escalation_channel"] = post["channel"]
+            app.logger.info("escalated group_key=%s age=%.1fh channel=%s ts=%s",
+                            group_key, age / 3600.0, post.get("channel"), post.get("ts"))
+        else:
+            # Roll the flag back so a later firing cycle retries.
+            if entry is not None:
+                entry["escalated"] = False
+            app.logger.warning("escalation post FAILED group_key=%s error=%s",
+                               group_key, post.get("error"))
+
+
+def resolve_escalation(entry: Dict, payload: Dict, group_key: str) -> None:
+    """When an escalated alert resolves, edit its escalation message to the
+    resolved (green) styling so the escalation channel shows it cleared."""
+    if not ESCALATION_CHANNEL_ID:
+        return
+    ts = entry.get("escalation_ts")
+    ch = entry.get("escalation_channel")
+    if not ts or not ch:
+        return
+    upd = slack_call("chat.update", {"channel": ch, "ts": ts, **build_message(payload)})
+    app.logger.info("escalation resolved group_key=%s ok=%s", group_key, upd.get("ok"))
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # State garbage collection
 # ──────────────────────────────────────────────────────────────────────────
 
@@ -535,21 +660,28 @@ def _handle_webhook(payload: Dict, group_key: str, channel_override: str = "") -
             **msg,
         })
         if update.get("ok"):
-            with state_lock:
-                if status == "resolved":
-                    # Evict immediately on resolve. A subsequent firing for the
-                    # same groupKey then takes the new-post path → fresh Slack
-                    # message → mobile/desktop notification. Without eviction,
-                    # the next firing would chat.update the now-resolved-styled
-                    # message in place, which Slack does NOT push a notification
-                    # for — the operator would miss the re-fire entirely.
+            if status == "resolved":
+                # Mirror the resolve into the escalation channel (if this group
+                # was escalated) before we drop the state that holds its ts.
+                resolve_escalation(entry, payload, group_key)
+                # Evict immediately on resolve. A subsequent firing for the
+                # same groupKey then takes the new-post path → fresh Slack
+                # message → mobile/desktop notification. Without eviction,
+                # the next firing would chat.update the now-resolved-styled
+                # message in place, which Slack does NOT push a notification
+                # for — the operator would miss the re-fire entirely.
+                with state_lock:
                     state.pop(group_key, None)
-                else:
+            else:
+                with state_lock:
                     state[group_key]["last_update"] = time.time()
             app.logger.info(
                 "update ok status=%s group_key=%s ts=%s image=%s",
                 status, group_key, entry["ts"], has_image,
             )
+            # Long-unresolved firing → one-time escalation (no-op if not due).
+            if status == "firing":
+                maybe_escalate(payload, group_key)
             return {"action": "update", "ts": entry["ts"]}, 200
 
         # Update failed (message gone, channel renamed, etc.) — fall through to post.
@@ -596,6 +728,9 @@ def _handle_webhook(payload: Dict, group_key: str, channel_override: str = "") -
                         "post (file) ok status=%s group_key=%s ts=%s file_id=%s updatable=%s",
                         status, group_key, ts or "(unknown)", up["file_id"], bool(ts),
                     )
+                    # Covers a long-firing alert that reposts fresh after state
+                    # loss (pod restart / TTL) already older than the threshold.
+                    maybe_escalate(payload, group_key)
                     return {"action": "post-file", "ts": ts, "file_id": up["file_id"]}, 200
                 app.logger.warning(
                     "file upload truly failed group_key=%s — falling back to chat.postMessage",
@@ -623,6 +758,8 @@ def _handle_webhook(payload: Dict, group_key: str, channel_override: str = "") -
             "post ok status=%s group_key=%s ts=%s image=%s existing_state=%s bridge_image_tried=%s",
             status, group_key, post["ts"], has_image, existing, bridge_image_path_tried,
         )
+        if status == "firing":
+            maybe_escalate(payload, group_key)
         return {"action": "post", "ts": post["ts"]}, 200
 
     app.logger.warning(
