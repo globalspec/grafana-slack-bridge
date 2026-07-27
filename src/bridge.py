@@ -190,42 +190,6 @@ def slack_call(method: str, payload: Dict) -> Dict:
     return data
 
 
-def resolve_channel_id(name: str) -> Optional[str]:
-    """Look up a Slack channel's id from its name. Cached forever per process.
-
-    Lookup order:
-      0. If `name` is already a channel ID (C/G/D-prefix), return as-is. This
-         is the path used by per-contact-point ?channel=Cxxx routing.
-      1. Cache (seeded from SLACK_CHANNEL_ID env + recent chat.postMessage replies)
-      2. conversations.list — requires channels:read scope which our bot
-         doesn't currently have. We still attempt it as a fallback so a future
-         scope grant works without needing a code change.
-    """
-    if name and name[0] in ("C", "G", "D") and name[1:].isalnum() and name.isupper():
-        return name
-    if name in _channel_id_cache:
-        return _channel_id_cache[name]
-    cursor = ""
-    while True:
-        r = _session.get("https://slack.com/api/conversations.list", params={
-            "exclude_archived": "true",
-            "limit": "1000",
-            "types": "public_channel,private_channel",
-            "cursor": cursor,
-        }, timeout=15)
-        data = r.json()
-        if not data.get("ok"):
-            app.logger.warning("conversations.list failed: %s — set SLACK_CHANNEL_ID env to skip this", data)
-            return None
-        for c in data.get("channels", []):
-            _channel_id_cache[c["name"]] = c["id"]
-        if name in _channel_id_cache:
-            return _channel_id_cache[name]
-        cursor = data.get("response_metadata", {}).get("next_cursor") or ""
-        if not cursor:
-            return None
-
-
 # ──────────────────────────────────────────────────────────────────────────
 # Grafana panel rendering
 # ──────────────────────────────────────────────────────────────────────────
@@ -310,101 +274,46 @@ def render_panel_png(payload: Dict) -> Optional[bytes]:
     return r.content
 
 
-def upload_image_with_message(png: bytes, filename: str, channel_id: str,
-                              initial_comment: str) -> Optional[Dict[str, str]]:
-    """Slack files.upload_v2 flow.
+def post_thread_image(png: bytes, channel_id: str, thread_ts: str) -> bool:
+    """Upload the rendered panel PNG as a threaded reply under the alert message.
 
-    Returns a dict on any successful upload (the file message IS in the
-    channel by then), or None only if the upload itself failed before Slack
-    accepted it. The dict's keys:
+    The parent alert is a chat.postMessage (so it can carry the Ack/Silence
+    buttons — Slack file messages can't hold blocks), and the image lives
+    in-thread. Best-effort: returns True on success, False on any failure. A
+    failure never affects the alert, which is already delivered.
 
-      file_id : always present once the upload was accepted
-      channel : the C-prefix channel id we shared to
-      ts      : the share message timestamp, IF we could recover it via
-                files.info — empty string otherwise
-
-    A successful upload with `ts=""` means the message IS visible in Slack
-    but we can't drive chat.update against it. The caller should still treat
-    this as a delivered notification (no fallback chat.postMessage) — we just
-    won't be able to coalesce future state transitions into the same message
-    for this group. The most likely reason ts isn't recovered is a Slack
-    scope gap (files.info shares field requires files:read + channel history
-    scopes which our bot doesn't currently have).
-
-    Three-step pattern per Slack docs:
-      1) files.getUploadURLExternal — reserve an upload slot
-      2) PUT bytes to the returned upload_url
-      3) files.completeUploadExternal — share to a channel
-      4) files.info — best-effort ts recovery (no longer fatal on miss)
+    Slack upload flow: getUploadURLExternal → PUT bytes → completeUploadExternal
+    (with channel_id + thread_ts to post it into the thread).
     """
-    # 1) reserve
     r = _session.get("https://slack.com/api/files.getUploadURLExternal", params={
-        "filename": filename, "length": str(len(png)),
+        "filename": "panel.png", "length": str(len(png)),
     }, timeout=15)
     data = r.json()
     if not data.get("ok"):
         app.logger.warning("getUploadURLExternal failed: %s", data)
-        return None
-    upload_url = data["upload_url"]
+        return False
     file_id = data["file_id"]
 
-    # 2) upload bytes (no auth header on the upload_url — token is in the URL)
     try:
-        up = requests.post(upload_url, data=png,
+        up = requests.post(data["upload_url"], data=png,
                            headers={"Content-Type": "application/octet-stream"},
                            timeout=60)
     except Exception as exc:
-        app.logger.warning("upload bytes error: %s", exc)
-        return None
+        app.logger.warning("thread image upload bytes error: %s", exc)
+        return False
     if up.status_code >= 300:
-        app.logger.warning("upload bytes status=%s body=%s", up.status_code, up.text[:200])
-        return None
+        app.logger.warning("thread image upload status=%s body=%s", up.status_code, up.text[:150])
+        return False
 
-    # 3) complete + share into channel
-    r = _session.post("https://slack.com/api/files.completeUploadExternal", json={
-        "files": [{"id": file_id, "title": filename}],
+    c = _session.post("https://slack.com/api/files.completeUploadExternal", json={
+        "files": [{"id": file_id, "title": "panel.png"}],
         "channel_id": channel_id,
-        "initial_comment": initial_comment,
-    }, timeout=15)
-    data = r.json()
-    if not data.get("ok"):
-        app.logger.warning("completeUploadExternal failed: %s", data)
-        return None
-
-    # From here on, the file is uploaded AND shared into the channel — the
-    # message is visible to users regardless of what files.info returns.
-
-    # 4) best-effort ts recovery so chat.update can later edit the comment.
-    # Up to 5 tries × 0.4s = 2s budget. Shares may be empty on the first
-    # response even after a successful complete; subsequent polls usually
-    # populate it. If still empty after the budget, log the full file
-    # object once and proceed without a ts.
-    last_info = None
-    for attempt in range(5):
-        info = _session.get("https://slack.com/api/files.info",
-                            params={"file": file_id}, timeout=15).json()
-        last_info = info
-        if not info.get("ok"):
-            break
-        shares = (info.get("file") or {}).get("shares") or {}
-        for visibility in ("public", "private"):
-            for ch, msgs in (shares.get(visibility) or {}).items():
-                if msgs:
-                    return {"file_id": file_id, "channel": ch, "ts": msgs[0].get("ts", "")}
-        time.sleep(0.4)
-
-    # Upload succeeded but ts couldn't be recovered. Log enough context to
-    # diagnose the scope/timing issue without spamming.
-    if last_info is not None:
-        f = last_info.get("file") if last_info.get("ok") else None
-        app.logger.warning(
-            "upload ok but ts recovery missed file_id=%s files.info.ok=%s "
-            "has_file=%s shares=%s (will deliver without chat.update support)",
-            file_id, last_info.get("ok"),
-            f is not None,
-            ((f or {}).get("shares") or {}) if f else last_info.get("error"),
-        )
-    return {"file_id": file_id, "channel": channel_id, "ts": ""}
+        "thread_ts": thread_ts,
+    }, timeout=15).json()
+    if not c.get("ok"):
+        app.logger.warning("thread image completeUploadExternal failed: %s", c.get("error"))
+        return False
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -946,81 +855,45 @@ def _handle_webhook(payload: Dict, group_key: str, channel_override: str = "") -
         with state_lock:
             state.pop(group_key, None)
 
-    # ── New group, first firing: try render+upload-as-file path ─────────
-    # We use Slack's files.upload_v2 + initial_comment so the file IS the
-    # parent message — gives us in-channel image + an editable text block
-    # for chat.update on subsequent state changes. We only attempt this on
-    # firing transitions (resolved-first events have no useful current image).
-    bridge_image_path_tried = False
-    if status == "firing":
-        png = render_panel_png(payload)
-        if png:
-            bridge_image_path_tried = True
-            channel_id = resolve_channel_id(channel)
-            if channel_id:
-                comment_text = format_title(payload) + "\n\n" + \
-                    "\n\n— — —\n\n".join(format_alert_section(a) for a in (payload.get("alerts") or []))
-                up = upload_image_with_message(png, "alert.png", channel_id,
-                                               comment_text[:2900])
-                if up:
-                    # Upload succeeded — the file message IS in the channel.
-                    # ts may be "" if we couldn't recover the share message ts
-                    # via files.info (likely a scope gap). In that case future
-                    # state transitions for this group_key will land as fresh
-                    # file messages rather than in-place updates — but we DO
-                    # NOT also post a chat.postMessage here; the user already
-                    # sees the alert + image once.
-                    ts = up.get("ts") or ""
-                    with state_lock:
-                        state[group_key] = {
-                            "ts":          ts,
-                            "channel":     up["channel"],
-                            "last_update": time.time(),
-                            "via":         "file" if ts else "file-noupdate",
-                        }
-                    app.logger.info(
-                        "post (file) ok status=%s group_key=%s ts=%s file_id=%s updatable=%s",
-                        status, group_key, ts or "(unknown)", up["file_id"], bool(ts),
-                    )
-                    # Covers a long-firing alert that reposts fresh after state
-                    # loss (pod restart / TTL) already older than the threshold.
-                    maybe_escalate(payload, group_key)
-                    return {"action": "post-file", "ts": ts, "file_id": up["file_id"]}, 200
-                app.logger.warning(
-                    "file upload truly failed group_key=%s — falling back to chat.postMessage",
-                    group_key,
-                )
-
-    # ── Fallback: plain chat.postMessage (no image) ────────────────────
+    # ── New group: post the main message, then attach the panel image as a
+    # threaded reply. The parent is always a chat.postMessage (NOT a file
+    # upload) so it can carry the Ack/Silence buttons — Slack file messages
+    # can't hold blocks. The rendered panel rides in-thread.
     post = slack_call("chat.postMessage", {"channel": channel, **msg})
-    if post.get("ok"):
-        # Opportunistically learn the channel ID (Slack returns the C-prefix
-        # ID in the response even when we addressed the channel by name).
-        # The next firing-of-a-new-group attempt can use the upload-as-file
-        # path without needing channels:read scope.
-        if post.get("channel") and not _channel_id_cache.get(channel):
-            _channel_id_cache[channel] = post["channel"]
-            app.logger.info("learned channel id name=%s id=%s", channel, post["channel"])
-        with state_lock:
-            state[group_key] = {
-                "ts":          post["ts"],
-                "channel":     post["channel"],
-                "last_update": time.time(),
-                "via":         "post",
-            }
-        app.logger.info(
-            "post ok status=%s group_key=%s ts=%s image=%s existing_state=%s bridge_image_tried=%s",
-            status, group_key, post["ts"], has_image, existing, bridge_image_path_tried,
-        )
-        if status == "firing":
-            maybe_escalate(payload, group_key)
-        return {"action": "post", "ts": post["ts"]}, 200
+    if not post.get("ok"):
+        app.logger.warning("post FAILED status=%s group_key=%s error=%s",
+                           status, group_key, post.get("error"))
+        return {"action": "failed", "error": post.get("error")}, 502
 
-    app.logger.warning(
-        "post FAILED status=%s group_key=%s error=%s",
-        status, group_key, post.get("error"),
-    )
-    return {"action": "failed", "error": post.get("error")}, 502
+    # Opportunistically learn the channel ID (Slack returns the C-prefix id even
+    # when we addressed the channel by name) — needed to share the thread image.
+    if post.get("channel") and not _channel_id_cache.get(channel):
+        _channel_id_cache[channel] = post["channel"]
+        app.logger.info("learned channel id name=%s id=%s", channel, post["channel"])
+    with state_lock:
+        state[group_key] = {
+            "ts":          post["ts"],
+            "channel":     post["channel"],
+            "last_update": time.time(),
+            "via":         "post",
+        }
+    app.logger.info("post ok status=%s group_key=%s ts=%s image=%s existing_state=%s",
+                    status, group_key, post["ts"], has_image, existing)
+
+    # Panel image as a threaded reply (firing only; best-effort — a render or
+    # upload failure never affects the alert, which is already delivered).
+    if status == "firing":
+        try:
+            png = render_panel_png(payload)
+            if png:
+                ok = post_thread_image(png, post["channel"], post["ts"])
+                app.logger.info("thread image group_key=%s ok=%s", group_key, ok)
+        except Exception as exc:
+            app.logger.warning("thread image error group_key=%s: %s", group_key, exc)
+        # Covers a long-firing alert reposting fresh after state loss but already
+        # older than the escalation threshold.
+        maybe_escalate(payload, group_key)
+    return {"action": "post", "ts": post["ts"]}, 200
 
 
 # Start the cleanup thread at module import time so it runs under both
