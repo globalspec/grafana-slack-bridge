@@ -40,6 +40,13 @@ Escalation (re-surface long-unresolved alerts) — OFF unless ESCALATE_ENABLED:
                         push a notification (default "<!here>"; "<!channel>" for
                         everyone; "" disables the ping)
 
+Interactive Ack / Silence buttons (Socket Mode) — OFF unless SLACK_APP_TOKEN:
+  SLACK_APP_TOKEN       — Slack app-level token (xapp-...) with connections:write.
+                        Enables Socket Mode (outbound WS) so button clicks reach
+                        the bridge with no public ingress. Unset ⇒ no buttons.
+  GRAFANA_SILENCE_TOKEN — Grafana service-account token with silence-write. The
+                        Silence buttons no-op (log a warning) without it.
+
 Per-contact-point channel routing:
   Add ?channel=Cxxxxxx (channel ID) or ?channel=name to the webhook URL on
   each Grafana contact point. This wins over SLACK_CHANNEL/SLACK_CHANNEL_ID,
@@ -49,6 +56,7 @@ Per-contact-point channel routing:
 
 import logging
 import os
+import re
 import sys
 import time
 import threading
@@ -107,6 +115,21 @@ ESCALATE_SEVERITIES = {
 # Prepended to escalation messages so Slack actually pushes a notification.
 # "<!here>" pings active members; "<!channel>" everyone; "" = no ping.
 ESCALATE_MENTION = os.environ.get("ESCALATE_MENTION", "<!here>").strip()
+
+# ── Interactive Ack / Silence buttons (Socket Mode) ────────────────────────
+# Buttons need Slack to deliver the click back to us. We use Socket Mode (an
+# OUTBOUND WebSocket) so this in-cluster bridge needs no public ingress — just
+# an app-level token (xapp-...). Enabled only when SLACK_APP_TOKEN is set.
+#   • Ack     → marks the alert acknowledged and halts escalation.
+#   • Silence → creates a Grafana silence (needs GRAFANA_SILENCE_TOKEN, a
+#               service-account token with silence-write) and halts escalation.
+# Buttons render on the chat.postMessage / escalation paths (not the
+# file-upload image path — Slack file messages can't carry blocks).
+SLACK_APP_TOKEN = os.environ.get("SLACK_APP_TOKEN", "").strip()
+BUTTONS_ENABLED = bool(SLACK_APP_TOKEN)
+GRAFANA_SILENCE_TOKEN = os.environ.get("GRAFANA_SILENCE_TOKEN", "").strip()
+# Durations offered by the Silence buttons (label, seconds).
+SILENCE_OPTIONS = [("1h", 3600), ("4h", 4 * 3600), ("24h", 24 * 3600)]
 
 # Grafana render endpoint — used to fetch host-specific panel images for the
 # firing alert. Grafana's built-in screenshot pipeline doesn't reliably attach
@@ -453,9 +476,34 @@ def format_alert_section(alert: Dict) -> str:
     return "\n".join(lines).strip()
 
 
-def build_message(payload: Dict) -> Dict[str, Any]:
+def _action_buttons_block(group_key: str) -> Dict[str, Any]:
+    """Top-level `actions` block: Acknowledge + Silence (1h/4h/24h). The
+    group_key rides in each element's `value` so the interaction handler knows
+    which alert was clicked. Kept at the message's top level (not inside the
+    coloured attachment) so chat.update can cleanly swap it for an ack/silence
+    note while leaving the attachment content intact."""
+    elements = [{
+        "type": "button",
+        "action_id": "alert_ack",
+        "text": {"type": "plain_text", "text": ":white_check_mark: Acknowledge"},
+        "style": "primary",
+        "value": group_key,
+    }]
+    for label, _sec in SILENCE_OPTIONS:
+        elements.append({
+            "type": "button",
+            "action_id": f"alert_silence_{label}",
+            "text": {"type": "plain_text", "text": f":mute: Silence {label}"},
+            "value": group_key,
+        })
+    return {"type": "actions", "block_id": "alert_actions", "elements": elements}
+
+
+def build_message(payload: Dict, group_key: Optional[str] = None) -> Dict[str, Any]:
     """Build the Slack API payload (excluding channel and ts).
-    Uses the `attachments` field for the colored sidebar Slack pattern."""
+    Uses the `attachments` field for the colored sidebar Slack pattern.
+    When buttons are enabled and a firing group_key is supplied, adds a
+    top-level Ack/Silence actions block."""
     status = payload.get("status", "firing")
     severity = (payload.get("commonLabels") or {}).get("severity", "info")
     color = attachment_color(status, severity)
@@ -491,10 +539,15 @@ def build_message(payload: Dict) -> Dict[str, Any]:
         })
 
     # Top-level `text` is used by Slack for notifications previews + accessibility
-    return {
+    msg: Dict[str, Any] = {
         "text": title,
         "attachments": [attachment],
     }
+    # Ack/Silence buttons ride at the top level (not in the attachment) so they
+    # can be swapped for an ack/silence note on click. Firing only.
+    if BUTTONS_ENABLED and group_key and status == "firing":
+        msg["blocks"] = [_action_buttons_block(group_key)]
+    return msg
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -533,11 +586,13 @@ def firing_age_sec(payload: Dict) -> Optional[float]:
     return max(ages) if ages else None
 
 
-def build_escalation_message(payload: Dict, age_sec: float) -> Dict[str, Any]:
+def build_escalation_message(payload: Dict, age_sec: float,
+                             group_key: Optional[str] = None) -> Dict[str, Any]:
     """Escalation variant of the normal message: a mention + 'unresolved Nh'
     banner prepended, forced critical colour. Mention goes in top-level `text`
-    too so Slack actually pushes the notification."""
-    base = build_message(payload)
+    too so Slack actually pushes the notification. Carries the Ack/Silence
+    buttons (the escalation is the prime place to act)."""
+    base = build_message(payload, group_key)
     hours = age_sec / 3600.0
     banner = (ESCALATE_MENTION + " " if ESCALATE_MENTION else "") + \
         f":bangbang: *ESCALATED — unresolved for {hours:.1f}h*"
@@ -546,7 +601,10 @@ def build_escalation_message(payload: Dict, age_sec: float) -> Dict[str, Any]:
     att["blocks"] = [{"type": "section", "text": {"type": "mrkdwn", "text": banner}}] + \
         list(att.get("blocks", []))
     text = (ESCALATE_MENTION + " " if ESCALATE_MENTION else "") + base.get("text", "")
-    return {"text": text, "attachments": [att]}
+    out: Dict[str, Any] = {"text": text, "attachments": [att]}
+    if base.get("blocks"):  # carry the Ack/Silence actions block through
+        out["blocks"] = base["blocks"]
+    return out
 
 
 def maybe_escalate(payload: Dict, group_key: str) -> None:
@@ -578,7 +636,7 @@ def maybe_escalate(payload: Dict, group_key: str) -> None:
                 e["escalated"] = False
         return
     post = slack_call("chat.postMessage",
-                      {"channel": target_channel, **build_escalation_message(payload, age)})
+                      {"channel": target_channel, **build_escalation_message(payload, age, group_key)})
     with state_lock:
         entry = state.get(group_key)
         if post.get("ok"):
@@ -597,15 +655,178 @@ def maybe_escalate(payload: Dict, group_key: str) -> None:
 
 def resolve_escalation(entry: Dict, payload: Dict, group_key: str) -> None:
     """When an escalated alert resolves, edit its escalation message to the
-    resolved (green) styling so the escalation channel shows it cleared."""
-    if not ESCALATION_CHANNEL_ID:
-        return
+    resolved (green) styling so the channel shows it cleared. Works for both the
+    dedicated-channel and in-channel escalation models — keyed off whether an
+    escalation message ts was recorded, not off ESCALATION_CHANNEL_ID."""
     ts = entry.get("escalation_ts")
     ch = entry.get("escalation_channel")
     if not ts or not ch:
         return
     upd = slack_call("chat.update", {"channel": ch, "ts": ts, **build_message(payload)})
     app.logger.info("escalation resolved group_key=%s ok=%s", group_key, upd.get("ok"))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Interactive buttons (Ack / Silence) — Socket Mode
+# ──────────────────────────────────────────────────────────────────────────
+
+_LABEL_RE = re.compile(r'(\w+)="((?:[^"\\]|\\.)*)"')
+
+
+def matchers_from_group_key(group_key: str) -> list:
+    """Reconstruct Grafana silence matchers from a Grafana groupKey. The instance
+    labels live in the trailing `:{alertname="…", host="…", …}` segment. We
+    silence on alertname (+ host if present) — i.e. this alert on this host."""
+    seg = group_key
+    idx = group_key.rfind(":{")
+    if idx != -1:
+        seg = group_key[idx + 2:]
+    labels = {k: v for k, v in _LABEL_RE.findall(seg)}
+    matchers = [{"name": n, "value": labels[n], "isRegex": False, "isEqual": True}
+                for n in ("alertname", "host") if labels.get(n)]
+    if not matchers:  # fallback: whatever labels we could parse
+        matchers = [{"name": k, "value": v, "isRegex": False, "isEqual": True}
+                    for k, v in labels.items()]
+    return matchers
+
+
+def create_grafana_silence(matchers: list, seconds: int, user: str):
+    """Create a Grafana silence via the alertmanager API. Returns (silence_id, None)
+    on success or (None, error_str) on failure."""
+    if not GRAFANA_SILENCE_TOKEN:
+        return None, "GRAFANA_SILENCE_TOKEN not configured"
+    if not matchers:
+        return None, "no matchers derived from group key"
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    body = {
+        "matchers": matchers,
+        "startsAt": now.strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "endsAt": (now + timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+        "comment": f"Silenced via Slack by {user}",
+        "createdBy": f"slack:{user}",
+    }
+    try:
+        r = requests.post(GRAFANA_URL + "/api/alertmanager/grafana/api/v2/silences",
+                          headers={"Authorization": "Bearer " + GRAFANA_SILENCE_TOKEN,
+                                   "Content-Type": "application/json"},
+                          json=body, timeout=15)
+    except Exception as exc:
+        return None, str(exc)
+    if r.status_code >= 300:
+        return None, f"HTTP {r.status_code}: {r.text[:200]}"
+    try:
+        d = r.json()
+    except Exception:
+        return None, "non-json response"
+    return d.get("silenceID") or d.get("silenceId"), None
+
+
+def _mark_handled(group_key: str, note: str) -> None:
+    """Record that an alert was acked/silenced: halt escalation and remember the
+    note so subsequent Grafana re-fires (which chat.update the message) keep the
+    note instead of restoring the buttons."""
+    with state_lock:
+        e = state.get(group_key)
+        if e is not None:
+            e["escalated"] = True   # blocks maybe_escalate
+            e["handled"] = True
+            e["handled_note"] = note
+
+
+def _finalize_message(orig_message: Dict, note: str) -> Dict[str, Any]:
+    """Rebuild a message: keep the coloured attachment content, replace the
+    top-level actions block with a context note (ack/silence outcome)."""
+    out: Dict[str, Any] = {
+        "text": note,
+        "blocks": [{"type": "context", "elements": [{"type": "mrkdwn", "text": note}]}],
+    }
+    att = orig_message.get("attachments")
+    if att:
+        out["attachments"] = att
+    return out
+
+
+def handle_interaction(payload: Dict) -> None:
+    """Dispatch a Slack block_actions payload (an Ack or Silence button click)."""
+    if payload.get("type") != "block_actions":
+        return
+    action = (payload.get("actions") or [{}])[0]
+    action_id = action.get("action_id", "")
+    group_key = action.get("value", "")
+    u = payload.get("user") or {}
+    uname = u.get("username") or u.get("name") or u.get("id") or "someone"
+    who = f"<@{u['id']}>" if u.get("id") else uname
+    channel = (payload.get("channel") or {}).get("id")
+    message = payload.get("message") or {}
+    ts = (payload.get("container") or {}).get("message_ts") or message.get("ts")
+    if not channel or not ts:
+        app.logger.warning("interaction missing channel/ts action=%s", action_id)
+        return
+
+    if action_id == "alert_ack":
+        note = f":white_check_mark: *Acknowledged* by {who}"
+        _mark_handled(group_key, note)
+        slack_call("chat.update", {"channel": channel, "ts": ts, **_finalize_message(message, note)})
+        app.logger.info("ack group_key=%s by=%s", group_key, uname)
+
+    elif action_id.startswith("alert_silence_"):
+        label = action_id.rsplit("_", 1)[-1]
+        seconds = dict(SILENCE_OPTIONS).get(label)
+        if not seconds:
+            return
+        sid, err = create_grafana_silence(matchers_from_group_key(group_key), seconds, uname)
+        if sid:
+            note = f":mute: *Silenced {label}* by {who}"
+            _mark_handled(group_key, note)
+            slack_call("chat.update", {"channel": channel, "ts": ts, **_finalize_message(message, note)})
+            app.logger.info("silence group_key=%s dur=%s by=%s id=%s", group_key, label, uname, sid)
+        else:
+            app.logger.warning("silence FAILED group_key=%s dur=%s err=%s", group_key, label, err)
+            slack_call("chat.postMessage", {"channel": channel, "thread_ts": ts,
+                                            "text": f":warning: Silence failed: {err}"})
+
+
+_socket_started = False
+_socket_lock = threading.Lock()
+
+
+def _start_socket_mode_once() -> None:
+    """Open the Socket Mode WebSocket (outbound) so button clicks reach us with no
+    ingress. No-op unless SLACK_APP_TOKEN is set. Reconnects are handled by the
+    slack_sdk client."""
+    if not BUTTONS_ENABLED:
+        return
+    global _socket_started
+    with _socket_lock:
+        if _socket_started:
+            return
+        _socket_started = True
+    try:
+        from slack_sdk.socket_mode import SocketModeClient
+        from slack_sdk.socket_mode.response import SocketModeResponse
+        from slack_sdk import WebClient
+    except Exception as exc:
+        app.logger.warning("slack_sdk unavailable — buttons disabled: %s", exc)
+        return
+
+    client = SocketModeClient(app_token=SLACK_APP_TOKEN, web_client=WebClient(token=SLACK_TOKEN))
+
+    def _listener(cli, req):
+        try:
+            if req.type == "interactive":
+                # Ack the envelope immediately (Slack requires <3s), then handle.
+                cli.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
+                handle_interaction(req.payload)
+        except Exception as exc:  # never let a bad payload kill the listener
+            app.logger.warning("socket interaction error: %s", exc)
+
+    client.socket_mode_request_listeners.append(_listener)
+    try:
+        client.connect()
+        app.logger.info("Socket Mode connected — Ack/Silence buttons enabled")
+    except Exception as exc:
+        app.logger.warning("Socket Mode connect failed: %s", exc)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -664,8 +885,17 @@ def _handle_webhook(payload: Dict, group_key: str, channel_override: str = "") -
     channel = channel_override \
         or (payload.get("commonLabels") or {}).get("channel") \
         or SLACK_CHANNEL
-    msg = build_message(payload)
+    msg = build_message(payload, group_key)
     status = payload.get("status", "firing")
+
+    # If this alert was already acked/silenced, a Grafana re-fire must NOT restore
+    # the buttons — keep the outcome note instead.
+    if status == "firing" and "blocks" in msg:
+        with state_lock:
+            e = state.get(group_key)
+            note = e.get("handled_note") if (e and e.get("handled")) else None
+        if note:
+            msg["blocks"] = [{"type": "context", "elements": [{"type": "mrkdwn", "text": note}]}]
 
     # Detect image presence for logging — useful when debugging missing screenshots
     has_image = any(
@@ -816,6 +1046,7 @@ def _start_cleanup_once():
         threading.Thread(target=cleanup_loop, daemon=True).start()
 
 _start_cleanup_once()
+_start_socket_mode_once()
 
 
 if __name__ == "__main__":

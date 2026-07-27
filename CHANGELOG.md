@@ -6,6 +6,29 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-27
+
+### Added
+- **Ack / Silence buttons via Socket Mode.** Alert (and escalation) messages now
+  carry **Acknowledge** and **Silence 1h/4h/24h** buttons. Clicks arrive over an
+  outbound **Socket Mode** WebSocket, so the in-cluster bridge needs no public
+  ingress — only an app-level token. **Ack** marks the alert acknowledged and
+  halts escalation; **Silence** creates a Grafana silence (matched on
+  `alertname`+`host` from the group key) and halts escalation. The clicked
+  message is edited in place to show who acted, and Grafana re-fires no longer
+  restore the buttons once handled. Off by default — enabled only when
+  `SLACK_APP_TOKEN` (xapp-…) is set; the Silence button additionally needs
+  `GRAFANA_SILENCE_TOKEN` (a service-account token with silence-write). Buttons
+  render on the chat.postMessage / escalation paths (not the file-upload image
+  path, which can't carry blocks). Adds `slack_sdk` dependency.
+
+### Fixed
+- **In-channel escalations weren't marked resolved.** `resolve_escalation`
+  early-returned unless `ESCALATION_CHANNEL_ID` was set, so with the default
+  in-channel model (v0.4.0) a resolved alert's escalation message kept its
+  "ESCALATED — unresolved" styling. Now keyed off whether an escalation message
+  was actually recorded.
+
 ## [0.4.0] — 2026-07-27
 
 ### Added
