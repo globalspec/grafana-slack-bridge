@@ -6,6 +6,20 @@ All notable changes to this project are documented here. Format follows
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-07-27
+
+### Changed
+- **Buttons on every alert.** The firing path no longer posts the panel image as
+  a file-upload *parent* message (which can't carry blocks, so those alerts had
+  no Ack/Silence buttons). Every alert is now a `chat.postMessage` — so it always
+  carries the buttons — and the rendered panel is posted as a **threaded reply**
+  underneath. The parent stays editable via chat.update for the alert's lifecycle.
+
+### Removed
+- `upload_image_with_message` and `resolve_channel_id` — dead after the post-path
+  rework (image is now a threaded reply; the channel id comes straight from the
+  chat.postMessage response).
+
 ## [0.5.0] — 2026-07-27
 
 ### Added
