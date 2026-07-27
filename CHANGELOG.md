@@ -14,13 +14,17 @@ All notable changes to this project are documented here. Format follows
   edit — so a critical that stays firing for hours quietly sinks down the
   channel and gets missed. When an alert of an escalated severity has been
   firing continuously for `ESCALATE_AFTER_HOURS` (default 4) without resolving,
-  the bridge now posts a single fresh, mention-tagged message to a separate
-  `ESCALATION_CHANNEL_ID`, and edits it to resolved styling when the alert
-  clears. Off by default — no behaviour change unless `ESCALATION_CHANNEL_ID`
-  is set. New env: `ESCALATION_CHANNEL_ID`, `ESCALATE_AFTER_HOURS`,
-  `ESCALATE_SEVERITIES` (default `critical`), `ESCALATE_MENTION` (default
-  `<!here>`). Firing age is derived from each alert's `startsAt`, so it works
-  even across a bridge restart that lost in-memory state.
+  the bridge now posts a single fresh, mention-tagged message that both
+  re-surfaces the alert and pings, and edits it to resolved styling when the
+  alert clears. Destination defaults to the alert's **own channel** (recommended
+  single-channel model — an `@here` where operators already watch); set
+  `ESCALATION_CHANNEL_ID` to escalate to a dedicated channel instead. Off by
+  default — gated behind `ESCALATE_ENABLED`, so the stock deployment is
+  unchanged. New env: `ESCALATE_ENABLED`, `ESCALATION_CHANNEL_ID` (optional),
+  `ESCALATE_AFTER_HOURS`, `ESCALATE_SEVERITIES` (default `critical`),
+  `ESCALATE_MENTION` (default `<!here>`; `<!channel>` for everyone). Firing age
+  is derived from each alert's `startsAt`, so it works even across a bridge
+  restart that lost in-memory state.
 
 ## [0.3.2] — 2026-05-19
 

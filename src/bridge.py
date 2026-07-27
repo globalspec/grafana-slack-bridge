@@ -28,13 +28,17 @@ Configuration via env:
   PORT                — listen port (default 8080)
   STATE_TTL_HOURS     — drop tracked groups idle longer than this (default 24)
 
-Escalation (re-surface long-unresolved alerts) — OFF unless configured:
-  ESCALATION_CHANNEL_ID — Slack channel ID (Cxxxx) for escalations. Unset ⇒
-                        escalation disabled entirely (default behaviour).
+Escalation (re-surface long-unresolved alerts) — OFF unless ESCALATE_ENABLED:
+  ESCALATE_ENABLED      — master switch (default false). When false, no
+                        escalation logic runs and behaviour is unchanged.
+  ESCALATION_CHANNEL_ID — Slack channel ID (Cxxxx) to escalate TO. Unset ⇒
+                        escalate IN the alert's own channel (recommended
+                        single-channel model): a fresh @here message there.
   ESCALATE_AFTER_HOURS  — a firing alert unresolved this long escalates (default 4)
   ESCALATE_SEVERITIES   — comma list of severities that can escalate (default "critical")
   ESCALATE_MENTION      — Slack mention prepended to escalations so they actually
-                        push a notification (default "<!here>"; "" disables the ping)
+                        push a notification (default "<!here>"; "<!channel>" for
+                        everyone; "" disables the ping)
 
 Per-contact-point channel routing:
   Add ?channel=Cxxxxxx (channel ID) or ?channel=name to the webhook URL on
@@ -81,11 +85,20 @@ STATE_TTL_SEC = int(_env("STATE_TTL_HOURS", "24")) * 3600
 # ── Escalation config ──────────────────────────────────────────────────────
 # When an alert of an escalated severity has been FIRING continuously for
 # ESCALATE_AFTER_SEC without resolving, post a single fresh, mention-tagged
-# message to ESCALATION_CHANNEL_ID. The primary path does chat.update in place,
-# which Slack never re-notifies for — so a critical that has been quietly
-# edited for hours otherwise sinks unnoticed. This re-surfaces it, once, in a
-# dedicated channel. Feature is OFF unless ESCALATION_CHANNEL_ID is set, so the
-# default deployment is byte-for-byte unchanged.
+# message. The primary path does chat.update in place, which Slack never
+# re-notifies for — so a critical that has been quietly edited for hours
+# otherwise sinks unnoticed. Posting a NEW message both re-surfaces it (bottom
+# of the channel) AND pings via the mention.
+#
+# Destination:
+#   • ESCALATION_CHANNEL_ID unset (default) → escalate IN the alert's own
+#     channel — a fresh @here/@channel message in the same place operators
+#     already watch. This is the recommended single-channel model.
+#   • ESCALATION_CHANNEL_ID set → escalate to that dedicated channel instead.
+#
+# OFF by default: escalation only runs when ESCALATE_ENABLED is truthy, so the
+# stock deployment is byte-for-byte unchanged.
+ESCALATE_ENABLED = os.environ.get("ESCALATE_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
 ESCALATION_CHANNEL_ID = os.environ.get("ESCALATION_CHANNEL_ID", "").strip()
 ESCALATE_AFTER_SEC = int(os.environ.get("ESCALATE_AFTER_HOURS", "4")) * 3600
 ESCALATE_SEVERITIES = {
@@ -538,8 +551,12 @@ def build_escalation_message(payload: Dict, age_sec: float) -> Dict[str, Any]:
 
 def maybe_escalate(payload: Dict, group_key: str) -> None:
     """Post a one-time escalation for a long-unresolved firing alert. No-op unless
-    the feature is configured. Call AFTER the primary send, with state unlocked."""
-    if not ESCALATION_CHANNEL_ID:
+    the feature is enabled. Call AFTER the primary send, with state unlocked.
+
+    Destination is ESCALATION_CHANNEL_ID if set, else the alert's own channel
+    (in-channel escalation): a fresh mention-tagged message that both re-surfaces
+    the alert and pings, since chat.update alone is silent."""
+    if not ESCALATE_ENABLED:
         return
     severity = (payload.get("commonLabels") or {}).get("severity", "")
     if severity not in ESCALATE_SEVERITIES:
@@ -553,8 +570,15 @@ def maybe_escalate(payload: Dict, group_key: str) -> None:
         if entry is None or entry.get("escalated"):
             return
         entry["escalated"] = True
+        target_channel = ESCALATION_CHANNEL_ID or entry.get("channel")
+    if not target_channel:
+        with state_lock:  # nothing to post to — release the flag for a retry
+            e = state.get(group_key)
+            if e is not None:
+                e["escalated"] = False
+        return
     post = slack_call("chat.postMessage",
-                      {"channel": ESCALATION_CHANNEL_ID, **build_escalation_message(payload, age)})
+                      {"channel": target_channel, **build_escalation_message(payload, age)})
     with state_lock:
         entry = state.get(group_key)
         if post.get("ok"):
