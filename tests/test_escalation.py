@@ -112,5 +112,49 @@ bridge.state["gk5"].update(escalated=True, escalation_ts="111.222", escalation_c
 bridge.resolve_escalation(bridge.state["gk5"], _payload("critical", 5, "resolved"), "gk5")
 _check("resolve updates escalation msg", any(c[0] == "chat.update" and c[1] == "CESC123" for c in _calls))
 
+# ── Ack / Silence buttons ──────────────────────────────────────────────────
+bridge.BUTTONS_ENABLED = True
+
+_m = bridge.build_message(_payload("critical", 1), "gk-btn")
+_acts = [b for b in _m.get("blocks", []) if b.get("type") == "actions"]
+_check("buttons present on firing", len(_acts) == 1)
+_ids = [e["action_id"] for e in _acts[0]["elements"]] if _acts else []
+_check("ack + 3 silence buttons",
+       _ids == ["alert_ack", "alert_silence_1h", "alert_silence_4h", "alert_silence_24h"])
+_check("button value carries group_key",
+       _acts and all(e["value"] == "gk-btn" for e in _acts[0]["elements"]))
+
+_mr = bridge.build_message(_payload("critical", 1, "resolved"), "gk-btn")
+_check("no buttons on resolved", not any(b.get("type") == "actions" for b in _mr.get("blocks", [])))
+
+_gk = '{}/{slack="true",team="infra"}/{severity="critical"}:{alertname="Windows disk volume critically full", host="LA-2PPF01", severity="critical"}'
+_mm = {x["name"]: x["value"] for x in bridge.matchers_from_group_key(_gk)}
+_check("matcher alertname parsed", _mm.get("alertname") == "Windows disk volume critically full")
+_check("matcher host parsed", _mm.get("host") == "LA-2PPF01")
+
+# Ack click
+_reset(); _seed("gkack")
+bridge.handle_interaction({"type": "block_actions", "user": {"id": "U1", "username": "max"},
+                           "channel": {"id": "C1"}, "container": {"message_ts": "9.9"},
+                           "message": {"attachments": [{"color": "#E01E5A"}]},
+                           "actions": [{"action_id": "alert_ack", "value": "gkack"}]})
+_check("ack updates message", any(c[0] == "chat.update" and c[1] == "C1" for c in _calls))
+_check("ack halts escalation + marks handled",
+       bridge.state["gkack"].get("escalated") is True and bridge.state["gkack"].get("handled") is True)
+
+# Silence click (mock the Grafana call)
+_reset(); _seed("gksil")
+_orig = bridge.create_grafana_silence
+bridge.create_grafana_silence = lambda matchers, seconds, user: ("sid-123", None)
+bridge.handle_interaction({"type": "block_actions", "user": {"id": "U1", "username": "max"},
+                           "channel": {"id": "C1"}, "container": {"message_ts": "9.9"},
+                           "message": {"attachments": [{"color": "x"}]},
+                           "actions": [{"action_id": "alert_silence_4h", "value": "gksil"}]})
+_check("silence updates message", any(c[0] == "chat.update" for c in _calls))
+_check("silence marks handled", bridge.state["gksil"].get("handled") is True)
+_check("handled note stored", str(bridge.state["gksil"].get("handled_note", "")).startswith(":mute:"))
+bridge.create_grafana_silence = _orig
+bridge.BUTTONS_ENABLED = False
+
 print("\nRESULT:", "ALL PASS" if not _fails else f"{len(_fails)} FAILED: {_fails}")
 sys.exit(1 if _fails else 0)
